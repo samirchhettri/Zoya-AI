@@ -1,0 +1,110 @@
+import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
+
+export interface LiveSessionOptions {
+  apiKey: string;
+  model: string;
+  systemInstruction: string;
+  onAudioData: (base64Data: string) => void;
+  onInterruption: () => void;
+  onToolCall: (name: string, args: any) => Promise<any>;
+  onStateChange: (state: LiveSessionState) => void;
+}
+
+export type LiveSessionState = 'disconnected' | 'connecting' | 'connected' | 'error' | 'permission-denied';
+
+export class LiveSession {
+  private ai: GoogleGenAI;
+  private session: any; // Using any for session since types are evolving in SDK
+  private options: LiveSessionOptions;
+
+  constructor(options: LiveSessionOptions) {
+    this.ai = new GoogleGenAI({ apiKey: options.apiKey });
+    this.options = options;
+  }
+
+  async connect() {
+    this.options.onStateChange('connecting');
+    try {
+      this.session = await this.ai.live.connect({
+        model: this.options.model,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+          },
+          systemInstruction: this.options.systemInstruction,
+          tools: [{
+            functionDeclarations: [{
+              name: "openWebsite",
+              description: "Opens a website to show the user information.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  url: { type: Type.STRING, description: "The full URL to open." },
+                  title: { type: Type.STRING, description: "A brief title of the site." }
+                },
+                required: ["url"]
+              }
+            }]
+          }]
+        },
+        callbacks: {
+          onopen: () => {
+            this.options.onStateChange('connected');
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            if (message.serverContent?.modelTurn?.parts) {
+              for (const part of message.serverContent.modelTurn.parts) {
+                if (part.inlineData?.data) {
+                  this.options.onAudioData(part.inlineData.data);
+                }
+              }
+            }
+
+            if (message.serverContent?.interrupted) {
+              this.options.onInterruption();
+            }
+
+            if (message.toolCall) {
+              for (const call of message.toolCall.functionCalls) {
+                const result = await this.options.onToolCall(call.name, call.args);
+                this.session.sendToolResponse({
+                  functionResponses: [{
+                    id: call.id,
+                    name: call.name,
+                    response: { result }
+                  }]
+                });
+              }
+            }
+          },
+          onclose: () => {
+            this.options.onStateChange('disconnected');
+          },
+          onerror: (error) => {
+            console.error("Live API Error:", error);
+            this.options.onStateChange('error');
+          }
+        }
+      });
+    } catch (err) {
+      console.error("Failed to connect to Live API:", err);
+      this.options.onStateChange('error');
+    }
+  }
+
+  sendAudio(base64Data: string) {
+    if (this.session) {
+      this.session.sendRealtimeInput({
+        audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+      });
+    }
+  }
+
+  disconnect() {
+    if (this.session) {
+      this.session.close();
+    }
+    this.options.onStateChange('disconnected');
+  }
+}
